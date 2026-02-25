@@ -12,7 +12,7 @@ typedef struct {
 typedef struct {
 	uint32_t n_vtx;
 	uint64_t n_arc;
-	char *graphSeq;
+	uint32_t *graphSeq;
 	uint32_t *seq_off;
 	int32_t *seq_len;
 	subgfa_arc_t *arc;
@@ -23,7 +23,7 @@ typedef struct {
 extern "C" {
 #endif
 
-int gwfa(int32_t ql, const char *q,
+int gwfa(int32_t ql, const uint32_t *q,
 	uint32_t startV, uint32_t endV,
 	subgfa_subgraph_t *sub, int32_t s_term,
 	int dbg);

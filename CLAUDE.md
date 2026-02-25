@@ -38,7 +38,7 @@ Tests rebuild from clean, run `./gwfa`, diff output against ground truth in
   pools (16M diagonal buffers, 4M hash slots) to avoid malloc in hot path.
   Wavefront extends diagonals along graph sequences, generates new diagonals
   at node boundaries, dedups, and checks termination.
-- **main.cpp** — C++ driver that loads datasets from `Datasets/Gwfa256/`,
+- **main.cpp** — C++ driver that loads datasets from `Datasets/Gwfa295/`,
   builds `subgfa_subgraph_t` per query, calls `gwfa()`, writes scores.
 - **ksort.h** — Macro-based radix/heap sort (from Attractive Chaos lib).
 - **kvec.h** — Simple dynamic array macros.
@@ -62,7 +62,7 @@ Active queue (`s_A`) uses circular buffer with shift-based indexing.
 
 ### Data format
 
-Input lives in `Datasets/Gwfa256/` as line-per-query text files: query
+Input lives in `Datasets/Gwfa295/` as line-per-query text files: query
 sequences (`q.txt`), lengths (`ql.txt`), graph topology (`arc_v.txt`,
 `arc_w.txt`, `arc_ow.txt`), vertex sequences (`graphSeq.txt`, `seq_off.txt`,
 `seq_len.txt`), start/end positions, and termination steps.

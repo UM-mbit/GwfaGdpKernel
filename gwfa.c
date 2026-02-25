@@ -5,7 +5,11 @@
 #include <stdlib.h>
 #include "gwfa.h"
 #include "ksort.h"
-#include "kvec.h"
+
+/* 2-bit packed encoding: A=0 C=1 G=2 T=3,
+   16 chars per uint32_t, LSB-first */
+#define GET_2BIT(arr, idx) \
+	(((arr)[(idx) >> 4] >> (((idx) & 0xF) << 1)) & 0x3)
 
 #ifndef GFA_ED_DBG
 #define GFA_ED_DBG 0
@@ -36,12 +40,12 @@ static FILE *gwf_wf_debug_fp(void) {
 #define HA_MASK   (HA_CAP - 1)
 #define A_MASK    (DIAG_CAP - 1)
 
-#define GWF_DIAG_SHIFT 0x40000000
+#define GWF_DIAG_SHIFT 0x4000
 
-static inline uint64_t gwf_gen_vd(
+static inline uint32_t gwf_gen_vd(
 	uint32_t v, int32_t d)
 {
-	return (uint64_t)v<<32
+	return (uint32_t)v << 16
 		| (GWF_DIAG_SHIFT + d);
 }
 
@@ -49,14 +53,12 @@ static inline uint64_t gwf_gen_vd(
  * Diagonal interval
  */
 typedef struct {
-	uint64_t vd0, vd1;
+	uint32_t vd0, vd1;
 } gwf_intv_t;
-
-typedef kvec_t(gwf_intv_t) gwf_intv_v;
 
 #define intvd_key(x) ((x).vd0)
 KRADIX_SORT_INIT(gwf_intv, gwf_intv_t,
-	intvd_key, 8)
+	intvd_key, 4)
 
 #define subgfa_arc_n(s, v) \
 	((uint32_t)(s)->idx[(v)])
@@ -77,7 +79,7 @@ static size_t gwf_intv_merge_adj(
 	size_t n, gwf_intv_t *a)
 {
 	size_t i, k;
-	uint64_t st, en;
+	uint32_t st, en;
 	if (n == 0) return 0;
 	st = a[0].vd0, en = a[0].vd1;
 	for (i = 1, k = 0; i < n; ++i) {
@@ -111,14 +113,12 @@ static size_t gwf_intv_merge2(gwf_intv_t *a,
  * Diagonal
  */
 typedef struct {
-	uint64_t vd;
+	uint32_t vd;
 	int32_t k;
 } gwf_diag_t;
 
-typedef kvec_t(gwf_diag_t) gwf_diag_v;
-
 #define ed_key(x) ((x).vd)
-KRADIX_SORT_INIT(gwf_ed, gwf_diag_t, ed_key, 8)
+KRADIX_SORT_INIT(gwf_ed, gwf_diag_t, ed_key, 4)
 
 /*
  * Core GWFA routine
@@ -132,7 +132,7 @@ static gwf_intv_t s_intv[INTV_CAP];
 static gwf_intv_t s_tmp[INTV_CAP];
 static gwf_intv_t s_swap[INTV_CAP];
 static gwf_diag_t s_sort_buf[DIAG_CAP];
-static uint64_t   s_ha_keys[HA_CAP];
+static uint32_t   s_ha_keys[HA_CAP];
 static uint8_t    s_ha_occ[HA_CAP];
 static uint32_t   s_ha_dirty[HA_CAP];
 
@@ -150,7 +150,7 @@ static inline void ha_clear(void) {
 }
 
 static inline uint32_t ha_put(
-	uint64_t key, int *absent)
+	uint32_t key, int *absent)
 {
 	uint32_t h = (uint32_t)key * 2654435769U
 		>> (32 - HA_BITS);
@@ -193,10 +193,10 @@ static inline gwf_diag_t A_shift(void) {
 
 // push (v,d,k) to the end of an array
 static inline void gwf_diag_push(
-	gwf_diag_v *a, uint32_t v,
-	int32_t d, int32_t k)
+	gwf_diag_t *a, int32_t *n,
+	uint32_t v, int32_t d, int32_t k)
 {
-	gwf_diag_t *p = &a->a[a->n++];
+	gwf_diag_t *p = &a[(*n)++];
 	p->vd = gwf_gen_vd(v, d), p->k = k;
 }
 
@@ -205,7 +205,7 @@ static inline int32_t gwf_diag_update(
 	gwf_diag_t *p, uint32_t v,
 	int32_t d, int32_t k)
 {
-	uint64_t vd = gwf_gen_vd(v, d);
+	uint32_t vd = gwf_gen_vd(v, d);
 	if (p->vd == vd) {
 		p->k = p->k > k ? p->k : k;
 		return 0;
@@ -216,14 +216,14 @@ static inline int32_t gwf_diag_update(
 // sort using n_sorted as split point
 static void gwf_diag_sort(int32_t n_a,
 	gwf_diag_t *a, int32_t n_sorted,
-	gwf_diag_v *buf)
+	gwf_diag_t *buf)
 {
 	int32_t i, j, k, n_b, n_c;
 	gwf_diag_t *b, *c;
 
 	n_b = n_sorted;
 	n_c = n_a - n_sorted;
-	b = buf->a, c = b + n_b;
+	b = buf, c = b + n_b;
 	memcpy(b, a, n_b * sizeof(*a));
 	memcpy(c, a + n_b, n_c * sizeof(*a));
 	radix_sort_gwf_ed(c, c + n_c);
@@ -241,7 +241,7 @@ static void gwf_diag_sort(int32_t n_a,
 // remove diagonals not on the wavefront
 static int32_t gwf_diag_dedup(int32_t n_a,
 	gwf_diag_t *a, int32_t n_sorted,
-	gwf_diag_v *buf)
+	gwf_diag_t *buf)
 {
 	int32_t i, n, st;
 	if (n_sorted < n_a)
@@ -292,148 +292,164 @@ static int32_t gwf_dedup(int32_t n_a,
 		s_intv_n = gwf_intv_merge2(s_intv,
 			swap_n, s_swap, s_tmp_n, s_tmp);
 	}
-	gwf_diag_v sb;
-	sb.a = s_sort_buf;
-	sb.n = 0;
-	sb.m = DIAG_CAP;
 	n_a = gwf_diag_dedup(
-		n_a, a, n_sorted, &sb);
+		n_a, a, n_sorted, s_sort_buf);
 	if (s_intv_n > 0)
 		n_a = gwf_mixed_dedup(n_a, a,
 			s_intv_n, s_intv);
 	return n_a;
 }
 
-// reach the wavefront
+// reach the wavefront (scalar 2-bit compare)
 static inline int32_t gwf_extend1(
 	int32_t d, int32_t k,
-	int32_t vl, const char *ts,
-	int32_t ql, const char *qs)
+	int32_t vl, const uint32_t *ts,
+	int32_t ts_off,
+	int32_t ql, const uint32_t *qs)
 {
 	int32_t max_k =
-		(ql - d < vl? ql - d : vl) - 1;
-	const char *ts_ = ts + 1, *qs_ = qs + d + 1;
-	uint64_t cmp = 0;
-	while (k + 7 < max_k) {
-		uint64_t x = *(uint64_t*)(ts_ + k);
-		uint64_t y = *(uint64_t*)(qs_ + k);
-		cmp = x ^ y;
-		if (cmp == 0) k += 8;
-		else break;
-	}
-	if (cmp)
-		k += __builtin_ctzl(cmp) >> 3;
-	else if (k + 7 >= max_k)
-		while (k < max_k
-			&& *(ts_ + k) == *(qs_ + k))
-			++k;
+		(ql - d < vl ? ql - d : vl) - 1;
+	while (k < max_k
+		&& GET_2BIT(ts, ts_off + k + 1)
+			== GET_2BIT(qs, d + k + 1))
+		++k;
 	return k;
 }
 
-// Landau-Vishkin for linear sequences
-static void gwf_ed_extend_batch(
-	const subgfa_subgraph_t *sub,
-	int32_t ql, const char *q, int32_t n,
-	gwf_diag_t *a, gwf_diag_v *B)
+// emit a b-entry, filtering out-of-bounds
+static inline void emit_b(
+	gwf_diag_t *B_a, int32_t *B_n,
+	uint32_t vd, int32_t k,
+	int32_t v, int32_t vl, int32_t ql)
 {
-	int32_t j, m;
-	int32_t v = a->vd>>32;
-	int32_t vl = sub->seq_len[v];
-	const char *ts =
-		sub->graphSeq + sub->seq_off[v];
-	gwf_diag_t *b;
-
-	// wfa_extend
-	for (j = 0; j < n; ++j)
-		a[j].k = gwf_extend1(
-			(int32_t)a[j].vd - GWF_DIAG_SHIFT,
-			a[j].k, vl, ts, ql, q);
-
-	// wfa_next
-	b = &B->a[B->n];
-	b[0].vd = a[0].vd - 1;
-	b[0].k = a[0].k + 1;
-	b[1].vd = a[0].vd;
-	b[1].k = (n == 1 || a[0].k > a[1].k
-		? a[0].k : a[1].k) + 1;
-	for (j = 1; j < n - 1; ++j) {
-		int32_t k = a[j-1].k;
-		k = k > a[j].k + 1
-			? k : a[j].k + 1;
-		k = k > a[j+1].k + 1
-			? k : a[j+1].k + 1;
-		b[j+1].vd = a[j].vd, b[j+1].k = k;
-	}
-	if (n >= 2) {
-		b[n].vd = a[n-1].vd;
-		b[n].k = a[n-2].k > a[n-1].k + 1
-			? a[n-2].k : a[n-1].k + 1;
-	}
-	b[n+1].vd = a[n-1].vd + 1;
-	b[n+1].k = a[n-1].k;
-
-	// drop out-of-bound cells
-	for (j = 0; j < n; ++j) {
-		gwf_diag_t *p = &a[j];
-		if (p->k == vl - 1
-			|| (int32_t)p->vd
-			- GWF_DIAG_SHIFT + p->k
-			== ql - 1)
-			*A_pushp() = *p;
-	}
-	for (j = 0, m = 0; j < n + 2; ++j) {
-		gwf_diag_t *p = &b[j];
-		int32_t d = (int32_t)p->vd
-			- GWF_DIAG_SHIFT;
-		if (d + p->k < ql && p->k < vl) {
-			b[m++] = *p;
-		} else if (p->k == vl) {
-			if (s_tmp_n >= INTV_CAP) {
-				fprintf(stderr,
-					"FATAL: s_tmp overflow in "
-					"gwf_ed_extend_batch "
-					"(n=%zu, cap=%d)\n",
-					s_tmp_n, INTV_CAP);
-				exit(1);
-			}
-			gwf_intv_t *qi;
-			qi = &s_tmp[s_tmp_n++];
-			qi->vd0 = gwf_gen_vd(v, d);
-			qi->vd1 = qi->vd0 + 1;
+	int32_t d = (int32_t)(vd & 0xFFFF)
+		- GWF_DIAG_SHIFT;
+	if (d + k < ql && k < vl) {
+		gwf_diag_t *p = &B_a[(*B_n)++];
+		p->vd = vd;
+		p->k = k;
+	} else if (k == vl) {
+		if (s_tmp_n >= INTV_CAP) {
+			fprintf(stderr,
+				"FATAL: s_tmp overflow "
+				"(n=%zu, cap=%d)\n",
+				s_tmp_n, INTV_CAP);
+			exit(1);
 		}
+		gwf_intv_t *qi = &s_tmp[s_tmp_n++];
+		qi->vd0 = gwf_gen_vd(v, d);
+		qi->vd1 = qi->vd0 + 1;
 	}
-	B->n += m;
 }
 
-// wfa_extend and wfa_next combined
+// check if diagonal hit boundary -> push to A
+static inline void boundary_check(
+	gwf_diag_t *p, int32_t vl, int32_t ql)
+{
+	int32_t d = (int32_t)(p->vd & 0xFFFF)
+		- GWF_DIAG_SHIFT;
+	if (p->k == vl - 1 || d + p->k == ql - 1)
+		*A_pushp() = *p;
+}
+
+// wfa_extend and wfa_next combined (fused)
 static gwf_diag_t *gwf_ed_extend(
 	const subgfa_subgraph_t *sub,
-	int32_t s, int32_t ql, const char *q,
+	int32_t s, int32_t ql, const uint32_t *q,
 	uint32_t endV,
 	int32_t *n_a_, gwf_diag_t *a,
 	int *terminate)
 {
-	int32_t i, x, n = *n_a_, do_dedup = 1;
-	gwf_diag_v B;
-	gwf_diag_t *b;
+	int32_t i, n = *n_a_, do_dedup = 1;
+	gwf_diag_t *B_a, *b;
+	int32_t B_n;
 
 	s_tmp_n = 0;
 	ha_clear();
 	A_clear();
 
 	/* B is the OTHER static buffer (ping-pong) */
-	B.a = (a == s_diag_a) ? s_diag_b : s_diag_a;
-	B.n = 0;
-	B.m = DIAG_CAP;
+	B_a = (a == s_diag_a) ? s_diag_b : s_diag_a;
+	B_n = 0;
 
-	for (x = 0, i = 1; i <= n; ++i) {
-		if (i == n || a[i].vd != a[i-1].vd + 1) {
-			gwf_ed_extend_batch(sub, ql, q, i - x, &a[x], &B);
-			x = i;
+	/* Fused extend + next: process one diagonal
+	   at a time, emitting b[] entries inline */
+	i = 0;
+	while (i < n) {
+		int32_t v = a[i].vd >> 16;
+		int32_t vl = sub->seq_len[v];
+		int32_t ts_off = sub->seq_off[v];
+		int32_t ppk, pk, k;
+
+		/* Extend first diagonal, emit b[0] */
+		a[i].k = gwf_extend1(
+			(int32_t)(a[i].vd & 0xFFFF)
+				- GWF_DIAG_SHIFT,
+			a[i].k, vl, sub->graphSeq,
+			ts_off, ql, q);
+		emit_b(B_a, &B_n, a[i].vd - 1,
+			a[i].k + 1, v, vl, ql);
+		boundary_check(&a[i], vl, ql);
+		ppk = a[i].k;
+		i++;
+
+		if (i < n
+			&& a[i].vd == a[i-1].vd + 1) {
+			/* Extend second diagonal,
+			   emit b[1] */
+			a[i].k = gwf_extend1(
+				(int32_t)(a[i].vd & 0xFFFF)
+					- GWF_DIAG_SHIFT,
+				a[i].k, vl, sub->graphSeq,
+				ts_off, ql, q);
+			k = (ppk > a[i].k
+				? ppk : a[i].k) + 1;
+			emit_b(B_a, &B_n, a[i-1].vd,
+				k, v, vl, ql);
+			boundary_check(&a[i], vl, ql);
+			pk = ppk;
+			ppk = a[i].k;
+			i++;
+
+			/* Interior diagonals */
+			while (i < n
+				&& a[i].vd == a[i-1].vd + 1)
+			{
+				a[i].k = gwf_extend1(
+					(int32_t)(a[i].vd & 0xFFFF)
+						- GWF_DIAG_SHIFT,
+					a[i].k, vl,
+					sub->graphSeq,
+					ts_off, ql, q);
+				k = pk;
+				if (ppk + 1 > k) k = ppk + 1;
+				if (a[i].k + 1 > k)
+					k = a[i].k + 1;
+				emit_b(B_a, &B_n,
+					a[i-1].vd, k,
+					v, vl, ql);
+				boundary_check(&a[i], vl, ql);
+				pk = ppk;
+				ppk = a[i].k;
+				i++;
+			}
+
+			/* Right side: b[n] */
+			k = pk > ppk + 1 ? pk : ppk + 1;
+			emit_b(B_a, &B_n, a[i-1].vd,
+				k, v, vl, ql);
+		} else {
+			/* n==1: emit b[1] */
+			emit_b(B_a, &B_n, a[i-1].vd,
+				ppk + 1, v, vl, ql);
 		}
+
+		/* Right boundary: b[n+1] */
+		emit_b(B_a, &B_n, a[i-1].vd + 1,
+			a[i-1].k, v, vl, ql);
 	}
 	if (A_size() == 0) do_dedup = 0;
-	int32_t n_sorted = B.n;
+	int32_t n_sorted = B_n;
 
 	while (A_size()) {
 		gwf_diag_t t;
@@ -441,19 +457,19 @@ static gwf_diag_t *gwf_ed_extend(
 		int32_t d, k, i, vl;
 
 		t = A_shift();
-		v = t.vd >> 32;
-		d = (int32_t)t.vd - GWF_DIAG_SHIFT;
+		v = t.vd >> 16;
+		d = (int32_t)(t.vd & 0xFFFF) - GWF_DIAG_SHIFT;
 		k = t.k;
 		vl = sub->seq_len[v];
 		k = gwf_extend1(d, k, vl,
-			sub->graphSeq + sub->seq_off[v],
+			sub->graphSeq, sub->seq_off[v],
 			ql, q);
 		i = k + d;
 
 		if (k + 1 < vl && i + 1 < ql) {
-			gwf_diag_push(&B, v, d-1, k+1);
-			gwf_diag_push(&B, v, d, k+1);
-			gwf_diag_push(&B, v, d+1, k);
+			gwf_diag_push(B_a, &B_n, v, d-1, k+1);
+			gwf_diag_push(B_a, &B_n, v, d, k+1);
+			gwf_diag_push(B_a, &B_n, v, d+1, k);
 		} else if (i + 1 < ql) {
 			int32_t nv =
 				subgfa_arc_n(sub, v);
@@ -477,11 +493,12 @@ static gwf_diag_t *gwf_ed_extend(
 				int32_t ol = av[j].ow;
 				int absent;
 				ha_put(
-					(uint64_t)w<<32
-					| (i + 1), &absent);
-				if (q[i + 1]
-					== (sub->graphSeq
-					+ sub->seq_off[w])[ol])
+					(uint32_t)w<<16
+					| ((i + 1) & 0xFFFF),
+					&absent);
+				if (GET_2BIT(q, i + 1)
+				== GET_2BIT(sub->graphSeq,
+					sub->seq_off[w] + ol))
 				{
 					++n_ext;
 					if (absent) {
@@ -492,36 +509,34 @@ static gwf_diag_t *gwf_ed_extend(
 						dp->k = ol;
 					}
 				} else if (absent) {
-					gwf_diag_push(&B,
+					gwf_diag_push(B_a, &B_n,
 						w, i - ol, ol);
-					gwf_diag_push(&B,
+					gwf_diag_push(B_a, &B_n,
 						w, i + 1 - ol, ol);
 				}
 			}
 			if (nv == 0 || n_ext != nv)
 				gwf_diag_push(
-					&B, v, d+1, k);
-		} else if (endV == (uint32_t)-1
-			|| (v == endV
-			&& k + 1 == vl)) {
+					B_a, &B_n, v, d+1, k);
+		} else if (v == endV && k + 1 == vl) {
 			*terminate = 1;
 			return 0;
 		} else if (k + 1 < vl) {
-			gwf_diag_push(&B, v, d-1, k+1);
+			gwf_diag_push(B_a, &B_n, v, d-1, k+1);
 		} else {
 			int32_t nv =
 				subgfa_arc_n(sub, v), j;
 			const subgfa_arc_t *av =
 				subgfa_arc_a(sub, v);
 			for (j = 0; j < nv; ++j)
-				gwf_diag_push(&B,
+				gwf_diag_push(B_a, &B_n,
 					av[j].w,
 					i - av[j].ow,
 					av[j].ow);
 		}
 	}
 
-	*n_a_ = n = B.n, b = B.a;
+	*n_a_ = n = B_n, b = B_a;
 
 	if (do_dedup)
 		*n_a_ = n = gwf_dedup(
@@ -536,10 +551,10 @@ static void gwf_ed_print_intv(size_t n,
 	size_t i;
 	for (i = 0; i < n; ++i)
 		fprintf(fp, "Z\t%d\t%d\t%d\n",
-			(int32_t)(a[i].vd0>>32),
-			(int32_t)a[i].vd0
+			(int32_t)(a[i].vd0>>16),
+			(int32_t)(a[i].vd0 & 0xFFFF)
 				- GWF_DIAG_SHIFT,
-			(int32_t)a[i].vd1
+			(int32_t)(a[i].vd1 & 0xFFFF)
 				- GWF_DIAG_SHIFT);
 	fflush(fp);
 }
@@ -551,8 +566,9 @@ static void gwf_ed_print_wf(int32_t n,
 	int32_t i;
 	for (i = 0; i < n; ++i) {
 		int32_t nid =
-			(int32_t)(a[i].vd >> 32);
-		int32_t diag = (int32_t)a[i].vd
+			(int32_t)(a[i].vd >> 16);
+		int32_t diag =
+			(int32_t)(a[i].vd & 0xFFFF)
 			- GWF_DIAG_SHIFT;
 		fprintf(fp, "WF\t%d\t%d\t%d\n",
 			nid, diag, a[i].k);
@@ -560,7 +576,7 @@ static void gwf_ed_print_wf(int32_t n,
 	fflush(fp);
 }
 
-int gwfa(int32_t ql, const char *q,
+int gwfa(int32_t ql, const uint32_t *q,
 	uint32_t startV, uint32_t endV,
 	subgfa_subgraph_t *sub, int32_t s_term,
 	int dbg)

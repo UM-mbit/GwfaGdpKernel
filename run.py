@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import sys, os, subprocess, re
 
-DUMP_DIR = "Datasets/Gwfa256"
+DUMP_DIR = "Datasets/Gwfa295"
 
 TESTS = {
     "1": {
@@ -17,7 +17,7 @@ TESTS = {
     "3": {
         "name": "wfDebug",
         "make": ["make", "DBG=1", "-j"],
-        "run_args": [DUMP_DIR, "762"],
+        "run_args": [DUMP_DIR, "1"],
     },
 }
 

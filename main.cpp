@@ -15,11 +15,37 @@ extern "C" {
 extern int gfa_ed_dbg;
 }
 
+/* ---- 2-bit encoding: A=0 C=1 G=2 T=3 ---- */
+
+static inline uint32_t char_to_2bit(char c) {
+	switch (c) {
+	case 'A': case 'a': return 0;
+	case 'C': case 'c': return 1;
+	case 'G': case 'g': return 2;
+	case 'T': case 't': return 3;
+	default: return 0;
+	}
+}
+
+// Pack a char string into uint32_t array
+// (16 chars per word, LSB-first)
+static uint32_t *encode_2bit(
+	const char *s, size_t len)
+{
+	size_t nw = (len + 15) / 16;
+	uint32_t *out = (uint32_t*)calloc(
+		nw, sizeof(uint32_t));
+	for (size_t i = 0; i < len; ++i)
+		out[i >> 4] |=
+			char_to_2bit(s[i]) << ((i & 0xF) << 1);
+	return out;
+}
+
 /* ---- Dump loading ---- */
 
 struct GwfaIterInput {
 	int32_t ql;
-	std::string q;
+	uint32_t *q_enc;  // 2-bit packed query
 	uint32_t startV;
 	uint32_t endV;
 	int32_t s_term;
@@ -99,10 +125,8 @@ static subgfa_subgraph_t *buildSubgraph(
 	sub->n_vtx = n_vtx;
 	sub->n_arc = n_arc;
 
-	size_t slen = graphSeq.size();
-	sub->graphSeq = (char*)malloc(slen);
-	memcpy(sub->graphSeq,
-		graphSeq.data(), slen);
+	sub->graphSeq = encode_2bit(
+		graphSeq.data(), graphSeq.size());
 
 	sub->seq_off = (uint32_t*)
 		malloc(n_vtx * sizeof(uint32_t));
@@ -167,7 +191,10 @@ loadGwfaDump(const std::string &dumpDir)
 		GwfaIterInput inp;
 		inp.ql = std::stoi(line);
 
-		readLine(fq, inp.q);
+		std::string q_str;
+		readLine(fq, q_str);
+		inp.q_enc = encode_2bit(
+			q_str.data(), q_str.size());
 
 		readLine(fsv, line);
 		inp.startV =
@@ -265,7 +292,7 @@ int main(int argc, char *argv[])
 			score = -1;
 		} else {
 			score = gwfa(inp.ql,
-				inp.q.c_str(),
+				inp.q_enc,
 				inp.startV, inp.endV,
 				inp.sub, inp.s_term,
 				gfa_ed_dbg);
@@ -283,6 +310,8 @@ int main(int argc, char *argv[])
 		std::cout << "ql: " << inp.ql
 			<< std::endl;
 		std::cout << std::endl;
+		free(inp.q_enc);
+		inp.q_enc = NULL;
 		if (inp.sub) {
 			subgfa_subgraph_destroy(inp.sub);
 			inp.sub = NULL;
