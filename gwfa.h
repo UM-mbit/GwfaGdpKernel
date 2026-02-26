@@ -19,12 +19,14 @@ typedef struct {
 	uint64_t *idx;
 } subgfa_subgraph_t;
 
+#define GWFA_START_V  0
+#define GWFA_END_V    65535
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 int gwfa(int32_t ql, const uint32_t *q,
-	uint32_t startV, uint32_t endV,
 	subgfa_subgraph_t *sub, int32_t s_term,
 	int dbg);
 

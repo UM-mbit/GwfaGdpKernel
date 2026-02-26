@@ -46,8 +46,6 @@ static uint32_t *encode_2bit(
 struct GwfaIterInput {
 	int32_t ql;
 	uint32_t *q_enc;  // 2-bit packed query
-	uint32_t startV;
-	uint32_t endV;
 	int32_t s_term;
 	subgfa_subgraph_t *sub;
 };
@@ -159,10 +157,6 @@ loadGwfaDump(const std::string &dumpDir)
 {
 	FILE *fql   = openDumpFile(dumpDir, "ql.txt");
 	FILE *fq    = openDumpFile(dumpDir, "q.txt");
-	FILE *fsv   = openDumpFile(
-		dumpDir, "startV.txt");
-	FILE *fev   = openDumpFile(
-		dumpDir, "endV.txt");
 	FILE *fst   = openDumpFile(
 		dumpDir, "s_term.txt");
 	FILE *fnv   = openDumpFile(
@@ -196,12 +190,6 @@ loadGwfaDump(const std::string &dumpDir)
 		inp.q_enc = encode_2bit(
 			q_str.data(), q_str.size());
 
-		readLine(fsv, line);
-		inp.startV =
-			(uint32_t)std::stoul(line);
-		readLine(fev, line);
-		inp.endV =
-			(uint32_t)std::stoul(line);
 		readLine(fst, line);
 		inp.s_term = std::stoi(line);
 
@@ -248,7 +236,6 @@ loadGwfaDump(const std::string &dumpDir)
 	}
 
 	fclose(fql);  fclose(fq);
-	fclose(fsv);  fclose(fev);
 	fclose(fst);
 	fclose(fnv);  fclose(fna);
 	fclose(fgs);  fclose(fsoff);
@@ -293,7 +280,6 @@ int main(int argc, char *argv[])
 		} else {
 			score = gwfa(inp.ql,
 				inp.q_enc,
-				inp.startV, inp.endV,
 				inp.sub, inp.s_term,
 				gfa_ed_dbg);
 		}

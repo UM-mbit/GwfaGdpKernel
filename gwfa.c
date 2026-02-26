@@ -356,7 +356,6 @@ static inline void boundary_check(
 static gwf_diag_t *gwf_ed_extend(
 	const subgfa_subgraph_t *sub,
 	int32_t s, int32_t ql, const uint32_t *q,
-	uint32_t endV,
 	int32_t *n_a_, gwf_diag_t *a,
 	int *terminate)
 {
@@ -518,7 +517,7 @@ static gwf_diag_t *gwf_ed_extend(
 			if (nv == 0 || n_ext != nv)
 				gwf_diag_push(
 					B_a, &B_n, v, d+1, k);
-		} else if (v == endV && k + 1 == vl) {
+		} else if (v == GWFA_END_V && k + 1 == vl) {
 			*terminate = 1;
 			return 0;
 		} else if (k + 1 < vl) {
@@ -577,7 +576,6 @@ static void gwf_ed_print_wf(int32_t n,
 }
 
 int gwfa(int32_t ql, const uint32_t *q,
-	uint32_t startV, uint32_t endV,
 	subgfa_subgraph_t *sub, int32_t s_term,
 	int dbg)
 {
@@ -594,14 +592,13 @@ int gwfa(int32_t ql, const uint32_t *q,
 	/* Initial wavefront */
 	a = s_diag_a;
 	n_a = 1;
-	a[0].vd = gwf_gen_vd(startV, 0);
+	a[0].vd = gwf_gen_vd(GWFA_START_V, 0);
 	a[0].k = -1;
 
 	s = 0;
 	while (n_a > 0) {
 		a = gwf_ed_extend(sub, s, ql, q,
-			endV, &n_a, a,
-			&terminate);
+			&n_a, a, &terminate);
 		if (terminate || s >= s_term) break;
 		++s;
 		if (dbg >= 1) {
