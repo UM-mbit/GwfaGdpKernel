@@ -30,6 +30,13 @@ int gwfa(int32_t ql, const uint32_t *q,
 	subgfa_subgraph_t *sub, int32_t s_term,
 	int dbg);
 
+void gwfa_init(int32_t ql, const uint32_t *q,
+	const subgfa_subgraph_t *sub, int dbg);
+void gwfa_reset_step(void);
+int gwfa_extend_step(int32_t s);
+void gwfa_debug_step(int32_t s);
+int gwfa_get_score(void);
+
 void subgfa_subgraph_destroy(
 	subgfa_subgraph_t *sub);
 

@@ -363,10 +363,6 @@ static gwf_diag_t *gwf_ed_extend(
 	gwf_diag_t *B_a, *b;
 	int32_t B_n;
 
-	s_tmp_n = 0;
-	ha_clear();
-	A_clear();
-
 	/* B is the OTHER static buffer (ping-pong) */
 	B_a = (a == s_diag_a) ? s_diag_b : s_diag_a;
 	B_n = 0;
@@ -575,45 +571,98 @@ static void gwf_ed_print_wf(int32_t n,
 	fflush(fp);
 }
 
-int gwfa(int32_t ql, const uint32_t *q,
-	subgfa_subgraph_t *sub, int32_t s_term,
-	int dbg)
-{
-	gwf_diag_t *a;
-	int32_t n_a, s;
-	int terminate = 0;
+/* ---- Split API: persistent state ---- */
+static subgfa_subgraph_t s_sub_copy;
+static int32_t s_ql;
+static const uint32_t *s_q;
+static int s_dbg;
+static gwf_diag_t *s_a;
+static int32_t s_n_a;
+static int32_t s_last_score;
 
-	/* Reset per-alignment counters */
+void gwfa_init(int32_t ql, const uint32_t *q,
+	const subgfa_subgraph_t *sub, int dbg)
+{
+	s_sub_copy = *sub;  /* shallow copy */
+	s_ql = ql;
+	s_q = q;
+	s_dbg = dbg;
+	s_last_score = -1;
+
 	s_intv_n = 0;
 	s_tmp_n = 0;
 	memset(s_ha_occ, 0, sizeof(s_ha_occ));
 	s_ha_n_dirty = 0;
 
-	/* Initial wavefront */
-	a = s_diag_a;
-	n_a = 1;
-	a[0].vd = gwf_gen_vd(GWFA_START_V, 0);
-	a[0].k = -1;
+	s_a = s_diag_a;
+	s_n_a = 1;
+	s_a[0].vd = gwf_gen_vd(GWFA_START_V, 0);
+	s_a[0].k = -1;
+}
 
-	s = 0;
-	while (n_a > 0) {
-		a = gwf_ed_extend(sub, s, ql, q,
-			&n_a, a, &terminate);
-		if (terminate || s >= s_term) break;
-		++s;
-		if (dbg >= 1) {
-			FILE *fp = gwf_wf_debug_fp();
-			fprintf(fp,
-				"[gfa_ed_step] dist=%d, n=%d,"
-				" n_intv=%zd, n_tb=0\n",
-				s, n_a, s_intv_n);
-			fflush(fp);
-			gwf_ed_print_intv(
-				s_intv_n, s_intv);
-			gwf_ed_print_wf(n_a, a);
-		}
+void gwfa_reset_step(void)
+{
+	s_tmp_n = 0;
+	ha_clear();
+	A_clear();
+}
+
+int gwfa_extend_step(int32_t s)
+{
+	int terminate = 0;
+	s_a = gwf_ed_extend(
+		&s_sub_copy, s, s_ql, s_q,
+		&s_n_a, s_a, &terminate);
+	if (terminate) {
+		s_last_score = s;
+		return 1;
 	}
-	return terminate ? s : -1;
+	if (s_n_a == 0) {
+		fprintf(stderr,
+			"gwfa_extend_step: n_a==0 at s=%d\n",
+			s);
+		s_last_score = -1;
+		return 1;
+	}
+	return 0;
+}
+
+void gwfa_debug_step(int32_t s)
+{
+	if (s_dbg >= 1) {
+		FILE *fp = gwf_wf_debug_fp();
+		fprintf(fp,
+			"[gfa_ed_step] dist=%d, n=%d,"
+			" n_intv=%zd, n_tb=0\n",
+			s, s_n_a, s_intv_n);
+		fflush(fp);
+		gwf_ed_print_intv(s_intv_n, s_intv);
+		gwf_ed_print_wf(s_n_a, s_a);
+	}
+}
+
+int gwfa_get_score(void)
+{
+	return s_last_score;
+}
+
+/* ---- Original monolithic API ---- */
+
+int gwfa(int32_t ql, const uint32_t *q,
+	subgfa_subgraph_t *sub, int32_t s_term,
+	int dbg)
+{
+	int32_t s;
+	gwfa_init(ql, q, sub, dbg);
+	for (s = 0; ; s++) {
+		gwfa_reset_step();
+		if (gwfa_extend_step(s))
+			break;
+		if (s >= s_term)
+			break;
+		gwfa_debug_step(s + 1);
+	}
+	return gwfa_get_score();
 }
 
 void subgfa_subgraph_destroy(
