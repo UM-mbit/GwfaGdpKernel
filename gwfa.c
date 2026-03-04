@@ -627,6 +627,477 @@ int gwfa_extend_step(int32_t s)
 	return 0;
 }
 
+/* SPM tile layout constants */
+#define N_TILE_DIAGS  64
+#define A_TILE_OFF    0     /* 128 words: 64 (vd,k) */
+#define SEQ_INFO_OFF  128   /* 128 words: 64 (off,len) */
+#define B_TILE_OFF    256   /* 384 words: 192 (vd,k) */
+#define A_OUT_OFF     640   /* 128 words: 64 (vd,k) */
+#define META_OFF      768   /* 8 words: n_b,n_A,n_seq,tile_n,n_vtx,gs_nw,ql,_ */
+#define SEQ_REGION_OFF 1024 /* sequences: seq_off, seq_len, graphSeq, query */
+#define PE_SPM_SIZE    8192 /* must match PE_SPM_SIZE in sys_def.h */
+
+/* Fused extend+next on a slice of diags.
+   Reads a[0:n], writes to b[*bn:] and aout[*aoutn:].
+   All diags within a group (same vertex, consecutive vd)
+   must be in the same call — never split groups.
+   seq_off/seq_len/graphSeq/q/ql are explicit so callers can
+   pass either main-memory or SPM-resident pointers. */
+static void phase1_fused(
+	gwf_diag_t *a, int32_t n,
+	gwf_diag_t *b, int32_t *bn,
+	gwf_diag_t *aout, int32_t *aoutn,
+	const uint32_t *seq_off, const int32_t *seq_len,
+	const uint32_t *graphSeq, const uint32_t *q, int32_t ql)
+{
+	int32_t i = 0;
+	while (i < n) {
+		int32_t v = a[i].vd >> 16;
+		int32_t vl = seq_len[v];
+		int32_t ts_off = seq_off[v];
+		int32_t ppk, pk, k, d;
+
+		a[i].k = gwf_extend1(
+			(int32_t)(a[i].vd & 0xFFFF) - GWF_DIAG_SHIFT,
+			a[i].k, vl, graphSeq, ts_off, ql, q);
+		emit_b(b, bn, a[i].vd - 1, a[i].k + 1, v, vl, ql);
+		d = (int32_t)(a[i].vd & 0xFFFF) - GWF_DIAG_SHIFT;
+		if (a[i].k == vl - 1 || d + a[i].k == ql - 1)
+			aout[(*aoutn)++] = a[i];
+		ppk = a[i].k;
+		i++;
+
+		if (i < n && a[i].vd == a[i-1].vd + 1) {
+			a[i].k = gwf_extend1(
+				(int32_t)(a[i].vd & 0xFFFF) - GWF_DIAG_SHIFT,
+				a[i].k, vl, graphSeq, ts_off, ql, q);
+			k = (ppk > a[i].k ? ppk : a[i].k) + 1;
+			emit_b(b, bn, a[i-1].vd, k, v, vl, ql);
+			d = (int32_t)(a[i].vd & 0xFFFF) - GWF_DIAG_SHIFT;
+			if (a[i].k == vl - 1 || d + a[i].k == ql - 1)
+				aout[(*aoutn)++] = a[i];
+			pk = ppk;
+			ppk = a[i].k;
+			i++;
+
+			while (i < n && a[i].vd == a[i-1].vd + 1) {
+				a[i].k = gwf_extend1(
+					(int32_t)(a[i].vd & 0xFFFF) - GWF_DIAG_SHIFT,
+					a[i].k, vl, graphSeq, ts_off, ql, q);
+				k = pk;
+				if (ppk + 1 > k) k = ppk + 1;
+				if (a[i].k + 1 > k) k = a[i].k + 1;
+				emit_b(b, bn, a[i-1].vd, k, v, vl, ql);
+				d = (int32_t)(a[i].vd & 0xFFFF) - GWF_DIAG_SHIFT;
+				if (a[i].k == vl - 1 || d + a[i].k == ql - 1)
+					aout[(*aoutn)++] = a[i];
+				pk = ppk;
+				ppk = a[i].k;
+				i++;
+			}
+
+			k = pk > ppk + 1 ? pk : ppk + 1;
+			emit_b(b, bn, a[i-1].vd, k, v, vl, ql);
+		} else {
+			emit_b(b, bn, a[i-1].vd, ppk + 1, v, vl, ql);
+		}
+
+		emit_b(b, bn, a[i-1].vd + 1, a[i-1].k, v, vl, ql);
+	}
+}
+
+
+int gwfa_extend_step_tiled(int32_t s, int *spm)
+{
+	int32_t cursor;
+	gwf_diag_t *B_a;
+	int32_t B_n = 0;
+
+	B_a = (s_a == s_diag_a) ? s_diag_b : s_diag_a;
+
+	/* Phase 1: tiled fused extend+next (fixed 64-diag tiles) */
+	for (cursor = 0; cursor < s_n_a; ) {
+		int32_t remaining = s_n_a - cursor;
+		int32_t tile_n = remaining < N_TILE_DIAGS ? remaining : N_TILE_DIAGS;
+
+		/* -- tile_load -- */
+		gwf_diag_t *tile_a = (gwf_diag_t *)(spm + A_TILE_OFF);
+		memcpy(tile_a, &s_a[cursor], tile_n * sizeof(gwf_diag_t));
+
+		/* -- tile_compute -- */
+		gwf_diag_t *tile_b = (gwf_diag_t *)(spm + B_TILE_OFF);
+		gwf_diag_t *tile_aout = (gwf_diag_t *)(spm + A_OUT_OFF);
+		int32_t tb_n = 0, ta_n = 0;
+		phase1_fused(tile_a, tile_n, tile_b, &tb_n, tile_aout, &ta_n,
+			s_sub_copy.seq_off, s_sub_copy.seq_len,
+			s_sub_copy.graphSeq, s_q, s_ql);
+
+		spm[META_OFF] = tb_n;
+		spm[META_OFF + 1] = ta_n;
+
+		/* -- tile_writeback -- */
+		memcpy(&B_a[B_n], tile_b, tb_n * sizeof(gwf_diag_t));
+		B_n += tb_n;
+		for (int32_t j = 0; j < ta_n; j++)
+			*A_pushp() = tile_aout[j];
+
+		cursor += tile_n;
+	}
+
+	/* Phase 2: A queue processing (same as gwf_ed_extend) */
+	int do_dedup = (A_size() > 0);
+	int32_t n_sorted = B_n;
+
+	while (A_size()) {
+		gwf_diag_t t;
+		uint32_t v;
+		int32_t d, k, i, vl;
+
+		t = A_shift();
+		v = t.vd >> 16;
+		d = (int32_t)(t.vd & 0xFFFF) - GWF_DIAG_SHIFT;
+		k = t.k;
+		vl = s_sub_copy.seq_len[v];
+		k = gwf_extend1(d, k, vl,
+			s_sub_copy.graphSeq, s_sub_copy.seq_off[v],
+			s_ql, s_q);
+		i = k + d;
+
+		if (k + 1 < vl && i + 1 < s_ql) {
+			gwf_diag_push(B_a, &B_n, v, d-1, k+1);
+			gwf_diag_push(B_a, &B_n, v, d, k+1);
+			gwf_diag_push(B_a, &B_n, v, d+1, k);
+		} else if (i + 1 < s_ql) {
+			int32_t nv = subgfa_arc_n(&s_sub_copy, v);
+			int32_t j, n_ext = 0;
+			const subgfa_arc_t *av = subgfa_arc_a(&s_sub_copy, v);
+			gwf_intv_t *p;
+			if (s_tmp_n >= INTV_CAP) {
+				fprintf(stderr, "FATAL: s_tmp overflow in tiled phase2 (n=%zu, cap=%d)\n", s_tmp_n, INTV_CAP);
+				exit(1);
+			}
+			p = &s_tmp[s_tmp_n++];
+			p->vd0 = gwf_gen_vd(v, d);
+			p->vd1 = p->vd0 + 1;
+			for (j = 0; j < nv; ++j) {
+				uint32_t w = av[j].w;
+				int32_t ol = av[j].ow;
+				int absent;
+				ha_put((uint32_t)w<<16 | ((i + 1) & 0xFFFF), &absent);
+				if (GET_2BIT(s_q, i + 1) == GET_2BIT(s_sub_copy.graphSeq, s_sub_copy.seq_off[w] + ol)) {
+					++n_ext;
+					if (absent) {
+						gwf_diag_t *dp = A_pushp();
+						dp->vd = gwf_gen_vd(w, i + 1 - ol);
+						dp->k = ol;
+					}
+				} else if (absent) {
+					gwf_diag_push(B_a, &B_n, w, i - ol, ol);
+					gwf_diag_push(B_a, &B_n, w, i + 1 - ol, ol);
+				}
+			}
+			if (nv == 0 || n_ext != nv)
+				gwf_diag_push(B_a, &B_n, v, d+1, k);
+		} else if (v == GWFA_END_V && k + 1 == vl) {
+			s_last_score = s;
+			return 1;
+		} else if (k + 1 < vl) {
+			gwf_diag_push(B_a, &B_n, v, d-1, k+1);
+		} else {
+			int32_t nv = subgfa_arc_n(&s_sub_copy, v), j;
+			const subgfa_arc_t *av = subgfa_arc_a(&s_sub_copy, v);
+			for (j = 0; j < nv; ++j)
+				gwf_diag_push(B_a, &B_n, av[j].w, i - av[j].ow, av[j].ow);
+		}
+	}
+
+	s_a = B_a;
+	s_n_a = B_n;
+
+	if (do_dedup)
+		s_n_a = gwf_dedup(s_n_a, s_a, n_sorted);
+
+	if (s_n_a == 0) {
+		fprintf(stderr, "gwfa_extend_step_tiled: n_a==0 at s=%d\n", s);
+		s_last_score = -1;
+		return 1;
+	}
+	return 0;
+}
+
+/* ---- Split API for ISA-driven tile loop ---- */
+static gwf_diag_t *s_B_a;
+static int32_t s_B_n;
+void gwfa_begin_step(void)
+{
+	s_tmp_n = 0;
+	ha_clear();
+	A_clear();
+	s_B_a = (s_a == s_diag_a) ? s_diag_b : s_diag_a;
+	s_B_n = 0;
+}
+
+/* Load one fixed-stride tile into spm.
+   Returns tile_n (number of diags loaded, 0..N_TILE_DIAGS). */
+static int32_t tile_load_one(int32_t cursor, int *spm)
+{
+	int32_t remaining = s_n_a - cursor;
+	if (remaining <= 0) {
+		spm[META_OFF] = 0;
+		spm[META_OFF + 1] = 0;
+		spm[META_OFF + 3] = 0;
+		return 0;
+	}
+	int32_t tile_n = remaining < N_TILE_DIAGS ? remaining : N_TILE_DIAGS;
+	uint64_t *dst = (uint64_t *)(spm + A_TILE_OFF);
+	const uint64_t *src = (const uint64_t *)&s_a[cursor];
+	for (int32_t i = 0; i < tile_n; i++)
+		dst[i] = src[i]; //mvd or mvqd
+	spm[META_OFF + 3] = tile_n;
+	return tile_n;
+}
+
+int32_t gwfa_tile_load_one(int32_t cursor, int *spm)
+{
+	return tile_load_one(cursor, spm);
+}
+
+void gwfa_tile_load_seq_info(int *spm)
+{
+	int32_t tile_n = spm[META_OFF + 3];
+	if (tile_n <= 0) { spm[META_OFF + 2] = 0; return; }
+	gwf_diag_t *tile_a = (gwf_diag_t *)(spm + A_TILE_OFF);
+	int32_t n_nodes = 0;
+	uint32_t prev_v = UINT32_MAX;
+	for (int32_t i = 0; i < tile_n; i++) {
+		uint32_t v = tile_a[i].vd >> 16;
+		if (v != prev_v) {
+			spm[SEQ_INFO_OFF + 2*n_nodes]     = (int)s_sub_copy.seq_off[v];
+			spm[SEQ_INFO_OFF + 2*n_nodes + 1] = s_sub_copy.seq_len[v];
+			n_nodes++;
+			prev_v = v;
+		}
+	}
+	spm[META_OFF + 2] = n_nodes;
+}
+
+/* Like phase1_fused, but reads seq_off/seq_len from a sequential
+   node_info table (pairs of int) instead of indexing by vertex ID. */
+// Phase 1 for SPM-tiled execution: fused extend + next-wavefront emit.
+// Extends each diagonal in `a` (Landau-Vishkin), then emits new diagonals
+// into `b` for the next edit distance. Diags that reach a node or query
+// boundary go into `aout` for phase 2 (cross-node propagation).
+//
+// For a run of consecutive diags d0..dN on the same vertex, the new
+// wavefront at diagonal d uses: k_new[d] = max(k[d-1], k[d]+1, k[d+1])
+// corresponding to insertion, substitution, and deletion edits.
+// We compute this in a single forward pass using a sliding window:
+//   ppk = k[d-2], pk = k[d-1], a[i].k = k[d]
+//
+// a:         input diags (sorted by vd), extended in-place
+// b/bn:      output next-wavefront diags (appended)
+// aout/aoutn: diags that reached a boundary (appended)
+// node_info: packed [seq_offset, seq_len] per node
+static void phase1_fused_spm(
+	gwf_diag_t *a, int32_t n,
+	gwf_diag_t *b, int32_t *bn,
+	gwf_diag_t *aout, int32_t *aoutn,
+	const int *node_info, int32_t n_nodes,
+	const uint32_t *graphSeq, const uint32_t *q, int32_t ql)
+{
+	int32_t i = 0, node_idx = -1;
+	uint32_t prev_v = UINT32_MAX;
+	while (i < n) {
+		// look up node sequence offset and length
+		int32_t v = a[i].vd >> 16;
+		if (v != prev_v) { node_idx++; prev_v = v; }
+		int32_t ts_off = node_info[2 * node_idx];
+		int32_t vl = node_info[2 * node_idx + 1];
+		int32_t ppk, pk, k, d;
+
+		// --- first diagonal in this run ---
+		a[i].k = gwf_extend1(
+			(int32_t)(a[i].vd & 0xFFFF) - GWF_DIAG_SHIFT,
+			a[i].k, vl, graphSeq, ts_off, ql, q);
+		// emit deletion: new diag at d-1 with k+1
+		emit_b(b, bn, a[i].vd - 1, a[i].k + 1, v, vl, ql);
+		d = (int32_t)(a[i].vd & 0xFFFF) - GWF_DIAG_SHIFT;
+		if (a[i].k == vl - 1 || d + a[i].k == ql - 1)
+			aout[(*aoutn)++] = a[i];
+		ppk = a[i].k;
+		i++;
+
+		if (i < n && a[i].vd == a[i-1].vd + 1) {
+			// --- second diagonal (have ppk, need sub between d0,d1) ---
+			a[i].k = gwf_extend1(
+				(int32_t)(a[i].vd & 0xFFFF) - GWF_DIAG_SHIFT,
+				a[i].k, vl, graphSeq, ts_off, ql, q);
+			// emit substitution at d0: max(k[d0], k[d1]) + 1
+			k = (ppk > a[i].k ? ppk : a[i].k) + 1;
+			emit_b(b, bn, a[i-1].vd, k, v, vl, ql);
+			d = (int32_t)(a[i].vd & 0xFFFF) - GWF_DIAG_SHIFT;
+			if (a[i].k == vl - 1 || d + a[i].k == ql - 1)
+				aout[(*aoutn)++] = a[i];
+			pk = ppk;
+			ppk = a[i].k;
+			i++;
+
+			// --- 3+ consecutive diags: full sliding window ---
+			while (i < n && a[i].vd == a[i-1].vd + 1) {
+				a[i].k = gwf_extend1(
+					(int32_t)(a[i].vd & 0xFFFF) - GWF_DIAG_SHIFT,
+					a[i].k, vl, graphSeq, ts_off, ql, q);
+				// emit at d-1: max(k[d-2], k[d-1]+1, k[d]+1)
+				k = pk;
+				if (ppk + 1 > k) k = ppk + 1;
+				if (a[i].k + 1 > k) k = a[i].k + 1;
+				emit_b(b, bn, a[i-1].vd, k, v, vl, ql);
+				d = (int32_t)(a[i].vd & 0xFFFF) - GWF_DIAG_SHIFT;
+				if (a[i].k == vl - 1 || d + a[i].k == ql - 1)
+					aout[(*aoutn)++] = a[i];
+				// slide window forward
+				pk = ppk;
+				ppk = a[i].k;
+				i++;
+			}
+
+			// emit substitution at last diagonal in the run
+			k = pk > ppk + 1 ? pk : ppk + 1;
+			emit_b(b, bn, a[i-1].vd, k, v, vl, ql);
+		} else {
+			// single diagonal: emit substitution (only neighbor is self)
+			emit_b(b, bn, a[i-1].vd, ppk + 1, v, vl, ql);
+		}
+
+		// emit insertion: new diag at d+1 with k[last]
+		emit_b(b, bn, a[i-1].vd + 1, a[i-1].k, v, vl, ql);
+	}
+}
+
+void gwfa_tile_compute(int *spm)
+{
+	int32_t tile_n = spm[META_OFF + 3];
+	if (tile_n <= 0) return;
+	int32_t n_nodes = spm[META_OFF + 2];
+	gwf_diag_t *tile_a = (gwf_diag_t *)(spm + A_TILE_OFF);
+	gwf_diag_t *tile_b = (gwf_diag_t *)(spm + B_TILE_OFF);
+	gwf_diag_t *tile_aout = (gwf_diag_t *)(spm + A_OUT_OFF);
+	int32_t tb_n = 0, ta_n = 0;
+	phase1_fused_spm(tile_a, tile_n, tile_b, &tb_n, tile_aout, &ta_n,
+		spm + SEQ_INFO_OFF, n_nodes, s_sub_copy.graphSeq, s_q, s_ql);
+	spm[META_OFF] = tb_n;
+	spm[META_OFF + 1] = ta_n;
+}
+
+void gwfa_B_push(uint32_t vd, int32_t k)
+{
+	s_B_a[s_B_n].vd = vd;
+	s_B_a[s_B_n].k = k;
+	s_B_n++;
+}
+
+void gwfa_tile_writeback_one(int *spm)
+{
+	int32_t tb_n = spm[META_OFF];
+	int32_t ta_n = spm[META_OFF + 1];
+	if (tb_n <= 0 && ta_n <= 0) return;
+	gwf_diag_t *tile_b = (gwf_diag_t *)(spm + B_TILE_OFF);
+	gwf_diag_t *tile_aout = (gwf_diag_t *)(spm + A_OUT_OFF);
+	memcpy(&s_B_a[s_B_n], tile_b, tb_n * sizeof(gwf_diag_t));
+	s_B_n += tb_n;
+	for (int32_t j = 0; j < ta_n; j++)
+		*A_pushp() = tile_aout[j];
+}
+
+int gwfa_phase2(int32_t s)
+{
+	int do_dedup = 1;
+	int32_t n_sorted = s_B_n;
+
+	while (A_size()) {
+		gwf_diag_t t;
+		uint32_t v;
+		int32_t d, k, i, vl;
+
+		t = A_shift();
+		v = t.vd >> 16;
+		d = (int32_t)(t.vd & 0xFFFF) - GWF_DIAG_SHIFT;
+		k = t.k;
+		vl = s_sub_copy.seq_len[v];
+		k = gwf_extend1(d, k, vl,
+			s_sub_copy.graphSeq, s_sub_copy.seq_off[v],
+			s_ql, s_q);
+		i = k + d;
+
+		if (k + 1 < vl && i + 1 < s_ql) {
+			gwf_diag_push(s_B_a, &s_B_n, v, d-1, k+1);
+			gwf_diag_push(s_B_a, &s_B_n, v, d, k+1);
+			gwf_diag_push(s_B_a, &s_B_n, v, d+1, k);
+		} else if (i + 1 < s_ql) {
+			int32_t nv = subgfa_arc_n(&s_sub_copy, v);
+			int32_t j, n_ext = 0;
+			const subgfa_arc_t *av = subgfa_arc_a(&s_sub_copy, v);
+			gwf_intv_t *p;
+			if (s_tmp_n >= INTV_CAP) {
+				fprintf(stderr, "FATAL: s_tmp overflow in phase2\n");
+				exit(1);
+			}
+			p = &s_tmp[s_tmp_n++];
+			p->vd0 = gwf_gen_vd(v, d);
+			p->vd1 = p->vd0 + 1;
+			for (j = 0; j < nv; ++j) {
+				uint32_t w = av[j].w;
+				int32_t ol = av[j].ow;
+				int absent;
+				ha_put((uint32_t)w<<16 | ((i + 1) & 0xFFFF), &absent);
+				if (GET_2BIT(s_q, i + 1) == GET_2BIT(s_sub_copy.graphSeq, s_sub_copy.seq_off[w] + ol)) {
+					++n_ext;
+					if (absent) {
+						gwf_diag_t *dp = A_pushp();
+						dp->vd = gwf_gen_vd(w, i + 1 - ol);
+						dp->k = ol;
+					}
+				} else if (absent) {
+					gwf_diag_push(s_B_a, &s_B_n, w, i - ol, ol);
+					gwf_diag_push(s_B_a, &s_B_n, w, i + 1 - ol, ol);
+				}
+			}
+			if (nv == 0 || n_ext != nv)
+				gwf_diag_push(s_B_a, &s_B_n, v, d+1, k);
+		} else if (v == GWFA_END_V && k + 1 == vl) {
+			s_last_score = s;
+			s_a = s_B_a;
+			s_n_a = s_B_n;
+			return 1;
+		} else if (k + 1 < vl) {
+			gwf_diag_push(s_B_a, &s_B_n, v, d-1, k+1);
+		} else {
+			int32_t nv = subgfa_arc_n(&s_sub_copy, v), j;
+			const subgfa_arc_t *av = subgfa_arc_a(&s_sub_copy, v);
+			for (j = 0; j < nv; ++j)
+				gwf_diag_push(s_B_a, &s_B_n, av[j].w, i - av[j].ow, av[j].ow);
+		}
+	}
+
+	s_a = s_B_a;
+	s_n_a = s_B_n;
+
+	if (do_dedup)
+		s_n_a = gwf_dedup(s_n_a, s_a, n_sorted);
+
+	if (s_n_a == 0) {
+		fprintf(stderr, "gwfa_phase2: n_a==0 at s=%d\n", s);
+		s_last_score = -1;
+		return 1;
+	}
+	return 0;
+}
+
+int32_t gwfa_get_n_a(void)
+{
+	return s_n_a;
+}
+
 void gwfa_debug_step(int32_t s)
 {
 	if (s_dbg >= 1) {

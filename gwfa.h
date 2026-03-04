@@ -34,6 +34,15 @@ void gwfa_init(int32_t ql, const uint32_t *q,
 	const subgfa_subgraph_t *sub, int dbg);
 void gwfa_reset_step(void);
 int gwfa_extend_step(int32_t s);
+int gwfa_extend_step_tiled(int32_t s, int *spm);
+void gwfa_begin_step(void);
+int32_t gwfa_tile_load_one(int32_t cursor, int *spm);
+void gwfa_tile_load_seq_info(int *spm);
+void gwfa_tile_compute(int *spm);
+void gwfa_B_push(uint32_t vd, int32_t k);
+void gwfa_tile_writeback_one(int *spm);
+int gwfa_phase2(int32_t s);
+int32_t gwfa_get_n_a(void);
 void gwfa_debug_step(int32_t s);
 int gwfa_get_score(void);
 
