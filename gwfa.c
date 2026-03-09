@@ -129,7 +129,7 @@ static gwf_diag_t s_diag_a[DIAG_CAP];
 static gwf_diag_t s_diag_b[DIAG_CAP];
 static gwf_diag_t s_A[DIAG_CAP];
 static gwf_intv_t s_intv[INTV_CAP];
-static gwf_intv_t s_tmp[INTV_CAP];
+static gwf_intv_t s_next_intv_buf[INTV_CAP];
 static gwf_intv_t s_swap[INTV_CAP];
 static gwf_diag_t s_sort_buf[DIAG_CAP];
 static uint32_t   s_ha_keys[HA_CAP];
@@ -139,7 +139,7 @@ static uint32_t   s_ha_dirty[HA_CAP];
 /* File-scope mutable counters */
 static uint32_t s_ha_n_dirty;
 static uint32_t s_A_head, s_A_tail, s_A_count;
-static size_t   s_intv_n, s_tmp_n;
+static size_t   s_intv_n, s_next_intv_buf_n;
 
 /* ---- hash set helpers ---- */
 static inline void ha_clear(void) {
@@ -280,17 +280,17 @@ static int32_t gwf_mixed_dedup(int32_t n_a,
 static int32_t gwf_dedup(int32_t n_a,
 	gwf_diag_t *a, int32_t n_sorted)
 {
-	if (s_intv_n + s_tmp_n > 0) {
+	if (s_intv_n + s_next_intv_buf_n > 0) {
 		size_t swap_n;
 		if (!gwf_intv_is_sorted(
-			s_tmp_n, s_tmp))
-			radix_sort_gwf_intv(s_tmp,
-				s_tmp + s_tmp_n);
+			s_next_intv_buf_n, s_next_intv_buf))
+			radix_sort_gwf_intv(s_next_intv_buf,
+				s_next_intv_buf + s_next_intv_buf_n);
 		memcpy(s_swap, s_intv,
 			s_intv_n * sizeof(gwf_intv_t));
 		swap_n = s_intv_n;
 		s_intv_n = gwf_intv_merge2(s_intv,
-			swap_n, s_swap, s_tmp_n, s_tmp);
+			swap_n, s_swap, s_next_intv_buf_n, s_next_intv_buf);
 	}
 	n_a = gwf_diag_dedup(
 		n_a, a, n_sorted, s_sort_buf);
@@ -329,16 +329,36 @@ static inline void emit_b(
 		p->vd = vd;
 		p->k = k;
 	} else if (k == vl) {
-		if (s_tmp_n >= INTV_CAP) {
+		if (s_next_intv_buf_n >= INTV_CAP) {
 			fprintf(stderr,
-				"FATAL: s_tmp overflow "
+				"FATAL: s_next_intv_buf overflow "
 				"(n=%zu, cap=%d)\n",
-				s_tmp_n, INTV_CAP);
+				s_next_intv_buf_n, INTV_CAP);
 			exit(1);
 		}
-		gwf_intv_t *qi = &s_tmp[s_tmp_n++];
+		gwf_intv_t *qi = &s_next_intv_buf[s_next_intv_buf_n++];
 		qi->vd0 = gwf_gen_vd(v, d);
 		qi->vd1 = qi->vd0 + 1;
+	}
+}
+
+// emit_b variant that writes intervals to SPM tile instead of globals
+static inline void emit_b_tile(
+	gwf_diag_t *B_a, int32_t *B_n,
+	int *tile_intv, int32_t *tile_intv_n,
+	uint32_t vd, int32_t k,
+	int32_t v, int32_t vl, int32_t ql)
+{
+	int32_t d = (int32_t)(vd & 0xFFFF) - GWF_DIAG_SHIFT;
+	if (d + k < ql && k < vl) {
+		gwf_diag_t *p = &B_a[(*B_n)++];
+		p->vd = vd;
+		p->k = k;
+	} else if (k == vl) {
+		uint32_t vd0 = gwf_gen_vd(v, d);
+		tile_intv[2 * (*tile_intv_n)] = (int)vd0;
+		tile_intv[2 * (*tile_intv_n) + 1] = (int)(vd0 + 1);
+		(*tile_intv_n)++;
 	}
 }
 
@@ -472,15 +492,15 @@ static gwf_diag_t *gwf_ed_extend(
 			const subgfa_arc_t *av =
 				subgfa_arc_a(sub, v);
 			gwf_intv_t *p;
-			if (s_tmp_n >= INTV_CAP) {
+			if (s_next_intv_buf_n >= INTV_CAP) {
 				fprintf(stderr,
-					"FATAL: s_tmp overflow in "
+					"FATAL: s_next_intv_buf overflow in "
 					"gwf_ed_extend "
 					"(n=%zu, cap=%d)\n",
-					s_tmp_n, INTV_CAP);
+					s_next_intv_buf_n, INTV_CAP);
 				exit(1);
 			}
-			p = &s_tmp[s_tmp_n++];
+			p = &s_next_intv_buf[s_next_intv_buf_n++];
 			p->vd0 = gwf_gen_vd(v, d);
 			p->vd1 = p->vd0 + 1;
 			for (j = 0; j < nv; ++j) {
@@ -590,7 +610,7 @@ void gwfa_init(int32_t ql, const uint32_t *q,
 	s_last_score = -1;
 
 	s_intv_n = 0;
-	s_tmp_n = 0;
+	s_next_intv_buf_n = 0;
 	memset(s_ha_occ, 0, sizeof(s_ha_occ));
 	s_ha_n_dirty = 0;
 
@@ -602,7 +622,7 @@ void gwfa_init(int32_t ql, const uint32_t *q,
 
 void gwfa_reset_step(void)
 {
-	s_tmp_n = 0;
+	s_next_intv_buf_n = 0;
 	ha_clear();
 	A_clear();
 }
@@ -632,9 +652,10 @@ int gwfa_extend_step(int32_t s)
 #define A_TILE_OFF    0     /* 128 words: 64 (vd,k) */
 #define SEQ_INFO_OFF  128   /* 128 words: 64 (off,len) */
 #define B_TILE_OFF    256   /* 384 words: 192 (vd,k) */
-#define A_OUT_OFF     640   /* 128 words: 64 (vd,k) */
-#define META_OFF      768   /* 8 words: n_b,n_A,n_seq,tile_n,n_vtx,gs_nw,ql,_ */
-#define SEQ_REGION_OFF 1024 /* sequences: seq_off, seq_len, graphSeq, query */
+#define INTV_TILE_OFF 640   /* 384 words: 192 intervals (vd0,vd1) */
+#define A_OUT_OFF     1024  /* 128 words: 64 (vd,k) */
+#define META_OFF      1152  /* 16 words: n_b,n_A,n_seq,tile_n,n_vtx,gs_nw,ql,n_intv */
+#define SEQ_REGION_OFF 1280 /* sequences: seq_off, seq_len, graphSeq, query */
 #define PE_SPM_SIZE    8192 /* must match PE_SPM_SIZE in sys_def.h */
 
 /* Fused extend+next on a slice of diags.
@@ -772,11 +793,11 @@ int gwfa_extend_step_tiled(int32_t s, int *spm)
 			int32_t j, n_ext = 0;
 			const subgfa_arc_t *av = subgfa_arc_a(&s_sub_copy, v);
 			gwf_intv_t *p;
-			if (s_tmp_n >= INTV_CAP) {
-				fprintf(stderr, "FATAL: s_tmp overflow in tiled phase2 (n=%zu, cap=%d)\n", s_tmp_n, INTV_CAP);
+			if (s_next_intv_buf_n >= INTV_CAP) {
+				fprintf(stderr, "FATAL: s_next_intv_buf overflow in tiled phase2 (n=%zu, cap=%d)\n", s_next_intv_buf_n, INTV_CAP);
 				exit(1);
 			}
-			p = &s_tmp[s_tmp_n++];
+			p = &s_next_intv_buf[s_next_intv_buf_n++];
 			p->vd0 = gwf_gen_vd(v, d);
 			p->vd1 = p->vd0 + 1;
 			for (j = 0; j < nv; ++j) {
@@ -830,7 +851,7 @@ static gwf_diag_t *s_B_a;
 static int32_t s_B_n;
 void gwfa_begin_step(void)
 {
-	s_tmp_n = 0;
+	s_next_intv_buf_n = 0;
 	ha_clear();
 	A_clear();
 	s_B_a = (s_a == s_diag_a) ? s_diag_b : s_diag_a;
@@ -902,6 +923,7 @@ static void phase1_fused_spm(
 	gwf_diag_t *a, int32_t n,
 	gwf_diag_t *b, int32_t *bn,
 	gwf_diag_t *aout, int32_t *aoutn,
+	int *tile_intv, int32_t *tile_intv_n,
 	const int *node_info, int32_t n_nodes,
 	const uint32_t *graphSeq, const uint32_t *q, int32_t ql)
 {
@@ -920,7 +942,7 @@ static void phase1_fused_spm(
 			(int32_t)(a[i].vd & 0xFFFF) - GWF_DIAG_SHIFT,
 			a[i].k, vl, graphSeq, ts_off, ql, q);
 		// emit deletion: new diag at d-1 with k+1
-		emit_b(b, bn, a[i].vd - 1, a[i].k + 1, v, vl, ql);
+		emit_b_tile(b, bn, tile_intv, tile_intv_n, a[i].vd - 1, a[i].k + 1, v, vl, ql);
 		d = (int32_t)(a[i].vd & 0xFFFF) - GWF_DIAG_SHIFT;
 		if (a[i].k == vl - 1 || d + a[i].k == ql - 1)
 			aout[(*aoutn)++] = a[i];
@@ -934,7 +956,7 @@ static void phase1_fused_spm(
 				a[i].k, vl, graphSeq, ts_off, ql, q);
 			// emit substitution at d0: max(k[d0], k[d1]) + 1
 			k = (ppk > a[i].k ? ppk : a[i].k) + 1;
-			emit_b(b, bn, a[i-1].vd, k, v, vl, ql);
+			emit_b_tile(b, bn, tile_intv, tile_intv_n, a[i-1].vd, k, v, vl, ql);
 			d = (int32_t)(a[i].vd & 0xFFFF) - GWF_DIAG_SHIFT;
 			if (a[i].k == vl - 1 || d + a[i].k == ql - 1)
 				aout[(*aoutn)++] = a[i];
@@ -951,7 +973,7 @@ static void phase1_fused_spm(
 				k = pk;
 				if (ppk + 1 > k) k = ppk + 1;
 				if (a[i].k + 1 > k) k = a[i].k + 1;
-				emit_b(b, bn, a[i-1].vd, k, v, vl, ql);
+				emit_b_tile(b, bn, tile_intv, tile_intv_n, a[i-1].vd, k, v, vl, ql);
 				d = (int32_t)(a[i].vd & 0xFFFF) - GWF_DIAG_SHIFT;
 				if (a[i].k == vl - 1 || d + a[i].k == ql - 1)
 					aout[(*aoutn)++] = a[i];
@@ -963,14 +985,14 @@ static void phase1_fused_spm(
 
 			// emit substitution at last diagonal in the run
 			k = pk > ppk + 1 ? pk : ppk + 1;
-			emit_b(b, bn, a[i-1].vd, k, v, vl, ql);
+			emit_b_tile(b, bn, tile_intv, tile_intv_n, a[i-1].vd, k, v, vl, ql);
 		} else {
 			// single diagonal: emit substitution (only neighbor is self)
-			emit_b(b, bn, a[i-1].vd, ppk + 1, v, vl, ql);
+			emit_b_tile(b, bn, tile_intv, tile_intv_n, a[i-1].vd, ppk + 1, v, vl, ql);
 		}
 
 		// emit insertion: new diag at d+1 with k[last]
-		emit_b(b, bn, a[i-1].vd + 1, a[i-1].k, v, vl, ql);
+		emit_b_tile(b, bn, tile_intv, tile_intv_n, a[i-1].vd + 1, a[i-1].k, v, vl, ql);
 	}
 }
 
@@ -982,11 +1004,13 @@ void gwfa_tile_compute(int *spm)
 	gwf_diag_t *tile_a = (gwf_diag_t *)(spm + A_TILE_OFF);
 	gwf_diag_t *tile_b = (gwf_diag_t *)(spm + B_TILE_OFF);
 	gwf_diag_t *tile_aout = (gwf_diag_t *)(spm + A_OUT_OFF);
-	int32_t tb_n = 0, ta_n = 0;
+	int32_t tb_n = 0, ta_n = 0, intv_n = 0;
 	phase1_fused_spm(tile_a, tile_n, tile_b, &tb_n, tile_aout, &ta_n,
+		spm + INTV_TILE_OFF, &intv_n,
 		spm + SEQ_INFO_OFF, n_nodes, s_sub_copy.graphSeq, s_q, s_ql);
 	spm[META_OFF] = tb_n;
 	spm[META_OFF + 1] = ta_n;
+	spm[META_OFF + 7] = intv_n;
 }
 
 void gwfa_B_push(uint32_t vd, int32_t k)
@@ -1000,13 +1024,23 @@ void gwfa_tile_writeback_one(int *spm)
 {
 	int32_t tb_n = spm[META_OFF];
 	int32_t ta_n = spm[META_OFF + 1];
-	if (tb_n <= 0 && ta_n <= 0) return;
+	int32_t n_intv = spm[META_OFF + 7];
 	gwf_diag_t *tile_b = (gwf_diag_t *)(spm + B_TILE_OFF);
 	gwf_diag_t *tile_aout = (gwf_diag_t *)(spm + A_OUT_OFF);
-	memcpy(&s_B_a[s_B_n], tile_b, tb_n * sizeof(gwf_diag_t));
-	s_B_n += tb_n;
+	if (tb_n > 0) {
+		memcpy(&s_B_a[s_B_n], tile_b,
+			tb_n * sizeof(gwf_diag_t));
+		s_B_n += tb_n;
+	}
 	for (int32_t j = 0; j < ta_n; j++)
 		*A_pushp() = tile_aout[j];
+	for (int32_t j = 0; j < n_intv; j++) {
+		s_next_intv_buf[s_next_intv_buf_n].vd0 =
+			(uint32_t)spm[INTV_TILE_OFF + 2*j];
+		s_next_intv_buf[s_next_intv_buf_n].vd1 =
+			(uint32_t)spm[INTV_TILE_OFF + 2*j + 1];
+		s_next_intv_buf_n++;
+	}
 }
 
 int gwfa_phase2(int32_t s)
@@ -1038,11 +1072,11 @@ int gwfa_phase2(int32_t s)
 			int32_t j, n_ext = 0;
 			const subgfa_arc_t *av = subgfa_arc_a(&s_sub_copy, v);
 			gwf_intv_t *p;
-			if (s_tmp_n >= INTV_CAP) {
-				fprintf(stderr, "FATAL: s_tmp overflow in phase2\n");
+			if (s_next_intv_buf_n >= INTV_CAP) {
+				fprintf(stderr, "FATAL: s_next_intv_buf overflow in phase2\n");
 				exit(1);
 			}
-			p = &s_tmp[s_tmp_n++];
+			p = &s_next_intv_buf[s_next_intv_buf_n++];
 			p->vd0 = gwf_gen_vd(v, d);
 			p->vd1 = p->vd0 + 1;
 			for (j = 0; j < nv; ++j) {
