@@ -139,15 +139,20 @@ static subgfa_subgraph_t *buildSubgraph(
 	sub->arc = (subgfa_arc_t*)
 		malloc(n_arc * sizeof(subgfa_arc_t));
 	for (uint64_t i = 0; i < n_arc; i++) {
-		sub->arc[i].v = arc_v[i];
-		sub->arc[i].w = arc_w[i];
+		sub->arc[i].v = (uint16_t)arc_v[i];
+		sub->arc[i].w = (uint16_t)arc_w[i];
 		sub->arc[i].ow = arc_ow[i];
 	}
 
-	sub->idx = (uint64_t*)
-		malloc(n_vtx * sizeof(uint64_t));
-	memcpy(sub->idx, idx.data(),
-		n_vtx * sizeof(uint64_t));
+	// Build CSR arc_off from cumulative n_arcs
+	sub->arc_off = (uint32_t*)
+		malloc((n_vtx + 1) * sizeof(uint32_t));
+	sub->arc_off[0] = 0;
+	for (uint32_t v = 0; v < n_vtx; v++) {
+		uint32_t n_arcs_v = (uint32_t)idx[v];
+		sub->arc_off[v + 1] =
+			sub->arc_off[v] + n_arcs_v;
+	}
 
 	return sub;
 }
