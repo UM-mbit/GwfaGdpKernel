@@ -35,7 +35,7 @@ static FILE *gwf_wf_debug_fp(void) {
 /* Static array capacity constants */
 #define DIAG_CAP  (16 << 20)   /* 16M = 2^24 */
 #define INTV_CAP  (1 << 21)    /* 2M (~32 MB) */
-#define HA_BITS   23           /* 8M slots */
+#define HA_BITS   22           /* 4M slots */
 #define HA_CAP    (1 << HA_BITS)
 #define HA_MASK   (HA_CAP - 1)
 #define A_MASK    (DIAG_CAP - 1)
@@ -198,13 +198,15 @@ static inline uint32_t ha_put(uint32_t key, int *absent)
 		if (cnt < HA_BUCKET_SIZE) {
 			bp[cnt] = (int)key;
 			bp[4] = cnt + 1;
-			if (s_ha_n_dirty >= HA_BUCKET_CAP) {
-				fprintf(stderr, "FATAL: ha_dirty overflow "
-					"(n=%u, cap=%d)\n",
-					s_ha_n_dirty, HA_BUCKET_CAP);
-				exit(1);
+			if (cnt == 0) {
+				if (s_ha_n_dirty >= HA_BUCKET_CAP) {
+					fprintf(stderr, "FATAL: ha_dirty overflow "
+						"(n=%u, cap=%d)\n",
+						s_ha_n_dirty, HA_BUCKET_CAP);
+					exit(1);
+				}
+				s_mm[MM_HA_DIRTY_OFF + s_ha_n_dirty++] = (int)b;
 			}
-			s_mm[MM_HA_DIRTY_OFF + s_ha_n_dirty++] = (int)b;
 			*absent = 1;
 			return b;
 		}
