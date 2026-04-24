@@ -49,6 +49,8 @@ int32_t gwfa_A_size(void);
 int32_t gwfa_phase2_tile_load(int *spm);
 void gwfa_phase2_tile_writeback(int *spm);
 int gwfa_phase2_finalize(void);
+void gwfa_finalize_sync(int32_t n_a, size_t intv_n);
+size_t gwfa_get_intv_n(void);
 void gwfa_set_score(int32_t s);
 int *gwfa_get_mm(void);
 void gwfa_sync_counters(int32_t B_n,

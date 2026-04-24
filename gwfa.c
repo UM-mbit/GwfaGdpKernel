@@ -134,7 +134,8 @@ KRADIX_SORT_INIT(gwf_ed, gwf_diag_t, ed_key, 4)
 #define HA_BUCKET_SIZE  4
 #define HA_BUCKET_CAP   (HA_CAP / HA_BUCKET_SIZE)  /* 1M buckets */
 #define HA_BUCKET_MASK  (HA_BUCKET_CAP - 1)
-#define HA_BUCKET_WORDS 5  /* 4 keys + 1 count per bucket */
+#define HA_BUCKET_WORDS 4  /* 4 keys, sentinel-based (no count) */
+#define HA_SENTINEL     ((int)0xFFFFFFFF)
 #define MM_HA_OFF       (MM_SORT_BUF_OFF + DIAG_CAP * 2)
 #define MM_HA_DIRTY_OFF (MM_HA_OFF + HA_BUCKET_CAP * HA_BUCKET_WORDS)
 #define MM_TOTAL_WORDS  (MM_HA_DIRTY_OFF + HA_BUCKET_CAP)
@@ -150,9 +151,9 @@ static void mm_init(void)
 			(size_t)MM_TOTAL_WORDS * 4 / (1024*1024));
 		exit(1);
 	}
-	/* Zero bucket counts so ha_put sees empty buckets */
-	for (size_t i = 0; i < HA_BUCKET_CAP; i++)
-		s_mm[MM_HA_OFF + i * HA_BUCKET_WORDS + 4] = 0;
+	/* Fill all bucket slots with sentinel (empty marker) */
+	for (size_t i = 0; i < HA_BUCKET_CAP * HA_BUCKET_WORDS; i++)
+		s_mm[MM_HA_OFF + i] = HA_SENTINEL;
 }
 
 /* Pointer aliases into MM — transparent to existing code */
@@ -171,16 +172,18 @@ static uint32_t s_A_head, s_A_tail, s_A_count;
 static size_t   s_intv_n, s_next_intv_buf_n;
 
 /* ---- bucket hash set helpers ---- */
-/* Clear all dirty buckets by zeroing their count word */
+/* Clear dirty buckets by writing sentinels to all 4 slots */
 static inline void ha_clear(void) {
 	for (uint32_t i = 0; i < s_ha_n_dirty; ++i) {
 		int b = s_mm[MM_HA_DIRTY_OFF + i];
-		s_mm[MM_HA_OFF + b * HA_BUCKET_WORDS + 4] = 0;
+		int *bp = s_mm + MM_HA_OFF + b * HA_BUCKET_WORDS;
+		bp[0] = bp[1] = bp[2] = bp[3] = HA_SENTINEL;
 	}
 	s_ha_n_dirty = 0;
 }
 
 /* Insert key into bucket hash table. Sets *absent=1 if new.
+ * Sentinel-based: scan for key match, then sentinel (empty).
  * Linear probing at bucket granularity. */
 static inline uint32_t ha_put(uint32_t key, int *absent)
 {
@@ -189,26 +192,26 @@ static inline uint32_t ha_put(uint32_t key, int *absent)
 	uint32_t b = (h >> 2) & HA_BUCKET_MASK;
 	while (1) {
 		int *bp = s_mm + MM_HA_OFF + b * HA_BUCKET_WORDS;
-		int cnt = bp[4];
-		for (int i = 0; i < cnt; i++)
+		for (int i = 0; i < HA_BUCKET_SIZE; i++) {
 			if ((uint32_t)bp[i] == key) {
 				*absent = 0;
 				return b;
 			}
-		if (cnt < HA_BUCKET_SIZE) {
-			bp[cnt] = (int)key;
-			bp[4] = cnt + 1;
-			if (cnt == 0) {
-				if (s_ha_n_dirty >= HA_BUCKET_CAP) {
-					fprintf(stderr, "FATAL: ha_dirty overflow "
-						"(n=%u, cap=%d)\n",
-						s_ha_n_dirty, HA_BUCKET_CAP);
-					exit(1);
+			if (bp[i] == HA_SENTINEL) {
+				bp[i] = (int)key;
+				if (i == 0) {
+					if (s_ha_n_dirty >= HA_BUCKET_CAP) {
+						fprintf(stderr, "FATAL: ha_dirty overflow "
+							"(n=%u, cap=%d)\n",
+							s_ha_n_dirty, HA_BUCKET_CAP);
+						exit(1);
+					}
+					s_mm[MM_HA_DIRTY_OFF + s_ha_n_dirty++]
+						= (int)b;
 				}
-				s_mm[MM_HA_DIRTY_OFF + s_ha_n_dirty++] = (int)b;
+				*absent = 1;
+				return b;
 			}
-			*absent = 1;
-			return b;
 		}
 		b = (b + 1) & HA_BUCKET_MASK;
 	}
@@ -1413,6 +1416,16 @@ int gwfa_phase2_finalize(void)
 		return 1;
 	}
 	return 0;
+}
+
+size_t gwfa_get_intv_n(void) { return s_intv_n; }
+
+// Sync finalize results from controller (no dedup logic)
+void gwfa_finalize_sync(int32_t n_a, size_t intv_n)
+{
+	s_a = s_B_a;
+	s_n_a = n_a;
+	s_intv_n = intv_n;
 }
 
 void gwfa_set_score(int32_t s)
