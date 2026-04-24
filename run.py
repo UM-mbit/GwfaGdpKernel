@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import sys, os, subprocess, re
 
-DUMP_DIR = "Datasets/Gwfa295"
+DUMP_DIR = "/data4/kaplannp/GenDP2/kernel/Gwfa/Datasets/Gwfa295"
 GOLDEN_SCORES = os.path.join(
     DUMP_DIR, "trueScores.txt")
 GOLDEN_DEBUG = os.path.join(
