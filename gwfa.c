@@ -832,6 +832,34 @@ void gwfa_begin_step(void)
 	s_B_n = 0;
 }
 
+/* Strong override of the weak no-op in gwfa_sim.cpp. Called once per
+ * case BEFORE gwfa_init() (which is called from magic 1). gwfa_init()
+ * only resets a subset of file-scope counters (s_intv_n,
+ * s_next_intv_buf_n, hash dirty list, A queue head/tail/count, and
+ * seeds s_a[0]); it does NOT zero the s_mm scratch buffer or the
+ * s_B_n / s_diag_b half. In batch mode (sim -n N with N>1) the
+ * residual diagonals/intervals/hash data from case N-1 caused case N
+ * to mis-score (one-off observed on Gwfa295 case 4: 2040 instead of
+ * golden 2039). This implementation rebuilds the post-mm_init state
+ * (zeroed buffer with HA_SENTINEL written into the hash region) and
+ * resets every file-scope counter so case N+1 starts clean. */
+void gwfa_reset_mm(void)
+{
+	if (s_mm) {
+		memset(s_mm, 0, (size_t)MM_TOTAL_WORDS * sizeof(int));
+		for (size_t i = 0; i < HA_BUCKET_CAP * HA_BUCKET_WORDS; i++)
+			s_mm[MM_HA_OFF + i] = HA_SENTINEL;
+	}
+	s_ha_n_dirty       = 0;
+	s_A_head           = 0;
+	s_A_tail           = 0;
+	s_A_count          = 0;
+	s_intv_n           = 0;
+	s_next_intv_buf_n  = 0;
+	s_B_n              = 0;
+	s_last_score       = -1;
+}
+
 /* Load one fixed-stride tile into spm.
    Returns tile_n (number of diags loaded, 0..N_TILE_DIAGS). */
 static int32_t tile_load_one(int32_t cursor, int *spm)
